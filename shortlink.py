@@ -1,873 +1,596 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Telegram Rewards Bot – One‑file version
+Arabic interface, referral system, task links, Supabase REST API, admin panel.
+Deployable on Railway.
+"""
+
+import os
+import re
 import asyncio
 import logging
-import os
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Dict, Any
 
+import requests
 from dotenv import load_dotenv
-from supabase import create_async_client
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ConversationHandler, filters, ContextTypes
+    Application, CommandHandler, MessageHandler,
+    ConversationHandler, CallbackQueryHandler, filters
 )
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import HTMLResponse
-import uvicorn
+from aiohttp import web
 
-# Load environment variables
+# ------------------------------
+#  Environment & Configuration
+# ------------------------------
 load_dotenv()
-
-# Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WEBSITE_URL = os.getenv("WEBSITE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+DOMAIN = os.getenv("DOMAIN")          # e.g. https://your-app.railway.app
+PORT = int(os.environ.get("PORT", 8080))
 
-if not all([BOT_TOKEN, ADMIN_ID, SUPABASE_URL, SUPABASE_KEY, WEBSITE_URL]):
-    raise ValueError("Missing required environment variables")
-
-# Constants
-REFERRAL_POINTS = 50
-MIN_WITHDRAWAL = 1000
-POINTS_TO_USD = 1000  # 1000 points = 1 USD
-
-# Conversation states
-ADD_TASK_TITLE, ADD_TASK_URL, ADD_TASK_REWARD = range(3)
-DELETE_TASK_SELECT = range(1)
-WITHDRAW_AMOUNT = range(1)
-BROADCAST_MESSAGE = range(1)
-
-# Setup logging
+# Logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Supabase client
-supabase = create_async_client(SUPABASE_URL, SUPABASE_KEY)
+# Supabase REST headers
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
+}
 
-# ============= Database Functions =============
+# ------------------------------
+#  Arabic UI Texts
+# ------------------------------
+MAIN_MENU_TEXTS = {
+    "tasks": "📋 عرض المهام",
+    "balance": "💰 رصيدي",
+    "referral": "👥 الإحالات",
+    "withdraw": "💸 سحب النقود"
+}
+ADMIN_BUTTON_TEXT = "👑 لوحة الإدارة"
 
-async def register_user(user_id: int, username: str = None, referred_by: int = None) -> Dict:
-    """Register a new user if not exists, handle referral points"""
-    try:
-        # Check if user exists
-        result = await supabase.table("users").select("*").eq("user_id", user_id).execute()
-        if result.data:
-            return result.data[0]
-        
-        # Register new user
-        user_data = {
-            "user_id": user_id,
-            "username": username,
-            "points": 0,
-            "referred_by": referred_by,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        # Insert user
-        result = await supabase.table("users").insert(user_data).execute()
-        new_user = result.data[0]
-        
-        # Give referral points if referred by someone
-        if referred_by and referred_by != user_id:
-            # Check if referrer exists and hasn't already received points for this referral
-            referrer = await supabase.table("users").select("*").eq("user_id", referred_by).execute()
-            if referrer.data:
-                # Add points to referrer
-                await supabase.table("users").update({
-                    "points": referrer.data[0]["points"] + REFERRAL_POINTS
-                }).eq("user_id", referred_by).execute()
-                
-                # Log referral (optional: could create a referrals table)
-                logger.info(f"Referral: {referred_by} got {REFERRAL_POINTS} points for inviting {user_id}")
-        
-        return new_user
-    except Exception as e:
-        logger.error(f"Error registering user {user_id}: {e}")
-        raise
+# ------------------------------
+#  Supabase REST Helpers (async)
+# ------------------------------
+def _rest_request(method: str, endpoint: str, data: dict = None) -> dict:
+    """Synchronous REST call to Supabase."""
+    url = f"{SUPABASE_URL}/rest/v1/{endpoint}"
+    resp = requests.request(method, url, headers=SUPABASE_HEADERS, json=data)
+    resp.raise_for_status()
+    return resp.json() if resp.text else {}
 
-async def get_user(user_id: int) -> Optional[Dict]:
-    """Get user data"""
-    try:
-        result = await supabase.table("users").select("*").eq("user_id", user_id).execute()
-        return result.data[0] if result.data else None
-    except Exception as e:
-        logger.error(f"Error getting user {user_id}: {e}")
-        return None
+async def supabase_request(method: str, endpoint: str, data: dict = None) -> dict:
+    """Async wrapper for Supabase REST."""
+    return await asyncio.to_thread(_rest_request, method, endpoint, data)
 
-async def add_points(user_id: int, points: int) -> bool:
-    """Add points to user"""
-    try:
-        result = await supabase.table("users").select("points").eq("user_id", user_id).execute()
-        if not result.data:
-            return False
-        current_points = result.data[0]["points"]
-        await supabase.table("users").update({
-            "points": current_points + points
-        }).eq("user_id", user_id).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error adding points to {user_id}: {e}")
+# ---------- Users ----------
+async def get_user(telegram_id: int) -> Optional[dict]:
+    res = await supabase_request("GET", f"users?telegram_id=eq.{telegram_id}&select=*")
+    return res[0] if res else None
+
+async def create_user(telegram_id: int, username: str = None, referred_by: int = None) -> dict:
+    data = {
+        "telegram_id": telegram_id,
+        "username": username,
+        "points": 0,
+        "referred_by": referred_by
+    }
+    await supabase_request("POST", "users", data)
+    return await get_user(telegram_id)
+
+async def update_user_points(telegram_id: int, delta: int) -> None:
+    user = await get_user(telegram_id)
+    if user:
+        new_points = user["points"] + delta
+        await supabase_request("PATCH", f"users?telegram_id=eq.{telegram_id}", {"points": new_points})
+
+async def get_user_stats(telegram_id: int) -> dict:
+    user = await get_user(telegram_id)
+    if not user:
+        return {"points": 0, "completed_tasks": 0, "referrals": 0}
+    comp = await supabase_request("GET", f"completed_tasks?user_id=eq.{user['id']}&select=id")
+    refs = await supabase_request("GET", f"users?referred_by=eq.{telegram_id}&select=id")
+    return {
+        "points": user["points"],
+        "completed_tasks": len(comp),
+        "referrals": len(refs)
+    }
+
+async def add_referrer_points(referrer_telegram_id: int) -> None:
+    await update_user_points(referrer_telegram_id, 50)
+
+# ---------- Tasks ----------
+async def get_active_tasks() -> List[dict]:
+    return await supabase_request("GET", "tasks?active=eq.true&select=*")
+
+async def get_task(task_id: int) -> Optional[dict]:
+    res = await supabase_request("GET", f"tasks?id=eq.{task_id}&select=*")
+    return res[0] if res else None
+
+async def add_task(title: str, reward: int, target_url: str) -> None:
+    data = {"title": title, "reward": reward, "target_url": target_url, "active": True}
+    await supabase_request("POST", "tasks", data)
+
+async def delete_task(task_id: int) -> None:
+    await supabase_request("DELETE", f"tasks?id=eq.{task_id}")
+
+# ---------- Completed Tasks ----------
+async def is_task_completed(user_telegram_id: int, task_id: int) -> bool:
+    user = await get_user(user_telegram_id)
+    if not user:
         return False
+    res = await supabase_request("GET", f"completed_tasks?user_id=eq.{user['id']}&task_id=eq.{task_id}")
+    return len(res) > 0
 
-async def complete_task(user_id: int, task_id: int) -> bool:
-    """Mark task as completed and award points"""
-    try:
-        # Check if already completed
-        completed = await supabase.table("completed_tasks").select("*").eq("user_id", user_id).eq("task_id", task_id).execute()
-        if completed.data:
-            return False
-        
-        # Get task reward
-        task = await supabase.table("tasks").select("reward").eq("id", task_id).eq("active", True).execute()
-        if not task.data:
-            return False
-        
-        reward = task.data[0]["reward"]
-        
-        # Add points to user
-        if not await add_points(user_id, reward):
-            return False
-        
-        # Record completion
-        await supabase.table("completed_tasks").insert({
-            "user_id": user_id,
-            "task_id": task_id,
-            "completed_at": datetime.utcnow().isoformat()
-        }).execute()
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error completing task {task_id} for user {user_id}: {e}")
+async def complete_task(user_telegram_id: int, task_id: int) -> bool:
+    """Award points and record completion. Returns True if succeeded."""
+    if await is_task_completed(user_telegram_id, task_id):
         return False
-
-async def get_active_tasks() -> List[Dict]:
-    """Get all active tasks"""
-    try:
-        result = await supabase.table("tasks").select("*").eq("active", True).order("id").execute()
-        return result.data
-    except Exception as e:
-        logger.error(f"Error fetching tasks: {e}")
-        return []
-
-async def add_task(title: str, destination_url: str, reward: int) -> bool:
-    """Add a new task"""
-    try:
-        await supabase.table("tasks").insert({
-            "title": title,
-            "destination_url": destination_url,
-            "reward": reward,
-            "active": True
-        }).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error adding task: {e}")
+    user = await get_user(user_telegram_id)
+    task = await get_task(task_id)
+    if not user or not task or not task["active"]:
         return False
+    # record completion
+    await supabase_request("POST", "completed_tasks", {"user_id": user["id"], "task_id": task_id})
+    # award points
+    await update_user_points(user_telegram_id, task["reward"])
+    return True
 
-async def delete_task(task_id: int) -> bool:
-    """Delete a task (soft delete by setting active=False)"""
-    try:
-        await supabase.table("tasks").update({"active": False}).eq("id", task_id).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error deleting task {task_id}: {e}")
+# ---------- Withdrawals ----------
+async def create_withdrawal_request(telegram_id: int, amount: int) -> bool:
+    user = await get_user(telegram_id)
+    if not user or user["points"] < amount or amount < 1000:
         return False
-
-async def get_total_users() -> int:
-    """Get total number of users"""
-    try:
-        result = await supabase.table("users").select("user_id", count="exact").execute()
-        return result.count
-    except Exception as e:
-        logger.error(f"Error getting user count: {e}")
-        return 0
-
-async def get_total_points() -> int:
-    """Get sum of all user points"""
-    try:
-        result = await supabase.table("users").select("points").execute()
-        return sum(user["points"] for user in result.data) if result.data else 0
-    except Exception as e:
-        logger.error(f"Error getting total points: {e}")
-        return 0
-
-async def get_completed_tasks_count() -> int:
-    """Get total number of completed tasks"""
-    try:
-        result = await supabase.table("completed_tasks").select("*", count="exact").execute()
-        return result.count
-    except Exception as e:
-        logger.error(f"Error getting completed tasks count: {e}")
-        return 0
-
-async def create_withdrawal(user_id: int, amount: int) -> bool:
-    """Create a withdrawal request"""
-    try:
-        # Check user balance
-        user = await get_user(user_id)
-        if not user or user["points"] < amount:
-            return False
-        
-        # Create request
-        await supabase.table("withdraw_requests").insert({
-            "user_id": user_id,
-            "amount": amount,
-            "status": "pending",
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-        
-        # Deduct points immediately (or after approval - we'll deduct after approval to be safe)
-        # Better to deduct after approval to avoid issues
-        return True
-    except Exception as e:
-        logger.error(f"Error creating withdrawal for {user_id}: {e}")
+    pending = await supabase_request("GET", f"withdrawals?user_id=eq.{user['id']}&status=eq.pending")
+    if pending:
         return False
+    data = {"user_id": user["id"], "amount": amount, "status": "pending"}
+    await supabase_request("POST", "withdrawals", data)
+    return True
 
-async def get_pending_withdrawals() -> List[Dict]:
-    """Get all pending withdrawal requests"""
-    try:
-        result = await supabase.table("withdraw_requests").select("*").eq("status", "pending").order("created_at").execute()
-        return result.data
-    except Exception as e:
-        logger.error(f"Error fetching withdrawals: {e}")
-        return []
+async def get_pending_withdrawals() -> List[dict]:
+    # Join with users table to get telegram_id and username
+    return await supabase_request(
+        "GET",
+        "withdrawals?status=eq.pending&select=*,users(telegram_id,username)"
+    )
 
-async def update_withdrawal_status(request_id: int, status: str, user_id: int = None) -> bool:
-    """Update withdrawal request status and deduct points if approved"""
-    try:
-        if status == "approved" and user_id:
-            # Get request details
-            req = await supabase.table("withdraw_requests").select("*").eq("id", request_id).execute()
-            if req.data:
-                amount = req.data[0]["amount"]
-                # Deduct points from user
-                user = await get_user(user_id)
-                if user:
-                    new_points = user["points"] - amount
-                    await supabase.table("users").update({"points": new_points}).eq("user_id", user_id).execute()
-        
-        await supabase.table("withdraw_requests").update({"status": status}).eq("id", request_id).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error updating withdrawal {request_id}: {e}")
-        return False
+async def get_user_by_id(user_id: int) -> Optional[dict]:
+    res = await supabase_request("GET", f"users?id=eq.{user_id}&select=*")
+    return res[0] if res else None
 
-async def get_all_users() -> List[Dict]:
-    """Get all users for broadcasting"""
-    try:
-        result = await supabase.table("users").select("user_id, username").execute()
-        return result.data
-    except Exception as e:
-        logger.error(f"Error fetching all users: {e}")
-        return []
+async def update_withdrawal_status(withdrawal_id: int, status: str, deduct_points: bool = False) -> None:
+    """status: approved / rejected. If deduct_points=True, subtract from user balance."""
+    w_req_list = await supabase_request("GET", f"withdrawals?id=eq.{withdrawal_id}&select=*")
+    if not w_req_list:
+        return
+    w = w_req_list[0]
+    if deduct_points and status == "approved":
+        user = await get_user_by_id(w["user_id"])
+        if user and user["points"] >= w["amount"]:
+            await update_user_points(user["telegram_id"], -w["amount"])
+    await supabase_request("PATCH", f"withdrawals?id=eq.{withdrawal_id}", {"status": status})
 
-# ============= Helper Functions =============
+# ---------- Admin Statistics ----------
+async def get_statistics() -> dict:
+    users = await supabase_request("GET", "users?select=id")
+    completed = await supabase_request("GET", "completed_tasks?select=id")
+    comp_with_tasks = await supabase_request(
+        "GET", "completed_tasks?select=task_id(*.reward)"
+    )
+    total_points = sum(
+        item["task_id"]["reward"] for item in comp_with_tasks if item.get("task_id")
+    )
+    pending = await supabase_request("GET", "withdrawals?status=eq.pending&select=id")
+    return {
+        "total_users": len(users),
+        "total_completed_tasks": len(completed),
+        "total_points_distributed": total_points,
+        "pending_withdrawals": len(pending)
+    }
 
-def get_main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Get main menu keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("📋 المهام", callback_data="menu_tasks")],
-        [InlineKeyboardButton("💰 رصيدي", callback_data="menu_balance")],
-        [InlineKeyboardButton("👥 دعوة الأصدقاء", callback_data="menu_referral")],
-        [InlineKeyboardButton("💸 سحب الأرباح", callback_data="menu_withdraw")]
+async def get_all_users() -> List[dict]:
+    return await supabase_request("GET", "users?select=telegram_id")
+
+# ------------------------------
+#  Telegram Bot – User Handlers
+# ------------------------------
+async def main_menu_keyboard(is_admin: bool = False):
+    keys = [
+        [KeyboardButton(MAIN_MENU_TEXTS["tasks"])],
+        [KeyboardButton(MAIN_MENU_TEXTS["balance"]), KeyboardButton(MAIN_MENU_TEXTS["referral"])],
+        [KeyboardButton(MAIN_MENU_TEXTS["withdraw"])]
     ]
     if is_admin:
-        keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(keyboard)
+        keys.append([KeyboardButton(ADMIN_BUTTON_TEXT)])
+    return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
-def get_admin_panel() -> InlineKeyboardMarkup:
-    """Get admin panel keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("➕ إضافة مهمة", callback_data="admin_add_task")],
-        [InlineKeyboardButton("❌ حذف مهمة", callback_data="admin_delete_task")],
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 إذاعة", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("💵 طلبات السحب", callback_data="admin_withdrawals")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# ============= Bot Handlers =============
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command with referral support"""
+async def start(update: Update, context):
     user = update.effective_user
-    user_id = user.id
-    username = user.username
-    
-    # Parse referral from command
+    telegram_id = user.id
     referred_by = None
+
+    # Parse referrer from start parameter
     if context.args and len(context.args) > 0:
-        arg = context.args[0]
-        if arg.startswith("ref_"):
-            try:
-                referred_by = int(arg.split("_")[1])
-                if referred_by == user_id:
-                    referred_by = None
-            except ValueError:
-                pass
-    
-    # Register user
-    await register_user(user_id, username, referred_by)
-    
-    # Send welcome message
-    welcome_text = (
-        f"🌟 مرحباً بك {user.first_name} في بوت المكافآت!\n\n"
-        f"📌 أكمل المهام واحصل على نقاط\n"
-        f"💵 1000 نقطة = 1 دولار\n"
-        f"👥 ادعو أصدقائك واحصل على {REFERRAL_POINTS} نقطة لكل صديق\n\n"
-        f"استخدم الأزرار أدناه للبدء:"
-    )
-    
-    is_admin = user_id == ADMIN_ID
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=get_main_menu(is_admin)
-    )
+        match = re.match(r"ref_(\d+)", context.args[0])
+        if match:
+            ref_id = int(match.group(1))
+            if ref_id != telegram_id:
+                referred_by = ref_id
+                await add_referrer_points(ref_id)
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu callback queries"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    data = query.data
-    
-    if data == "menu_tasks":
-        await show_tasks(query, user_id)
-    elif data == "menu_balance":
-        await show_balance(query, user_id)
-    elif data == "menu_referral":
-        await show_referral(query, context, user_id)
-    elif data == "menu_withdraw":
-        await start_withdraw(query, user_id, context)
-    elif data == "admin_panel":
-        if user_id == ADMIN_ID:
-            await query.edit_message_text(
-                "⚙️ لوحة التحكم - اختر إجراء:",
-                reply_markup=get_admin_panel()
-            )
-        else:
-            await query.edit_message_text("⛔ غير مصرح به")
-    elif data == "back_to_main":
-        await query.edit_message_text(
-            "القائمة الرئيسية:",
-            reply_markup=get_main_menu(user_id == ADMIN_ID)
-        )
+    existing = await get_user(telegram_id)
+    if not existing:
+        await create_user(telegram_id, user.username, referred_by)
+        msg = "✨ مرحباً! تم تسجيلك بنجاح.\nاستخدم الأزرار أدناه للبدء."
+    else:
+        msg = "👋 أهلاً بك مجدداً!"
 
-async def show_tasks(query, user_id: int):
-    """Show active tasks"""
+    is_admin = (telegram_id == ADMIN_ID)
+    await update.message.reply_text(msg, reply_markup=await main_menu_keyboard(is_admin))
+
+async def show_tasks(update: Update, context):
+    user_id = update.effective_user.id
     tasks = await get_active_tasks()
     if not tasks:
-        await query.edit_message_text("📭 لا توجد مهام متاحة حالياً", reply_markup=get_main_menu(False))
+        await update.message.reply_text("⚠️ لا توجد مهام حالياً.")
         return
-    
-    keyboard = []
     for task in tasks:
-        verification_url = f"{WEBSITE_URL}/reward?user_id={user_id}&task_id={task['id']}"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"📌 {task['title']} - {task['reward']} نقطة",
-                url=verification_url
-            )
-        ])
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")])
-    
-    await query.edit_message_text(
-        "📋 المهام المتاحة:\n\nاضغط على أي مهمة لفتح الرابط وإكمالها",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        link = f"{DOMAIN}/go?task_id={task['id']}&user_id={user_id}"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 تنفيذ المهمة", url=link)]])
+        text = f"📌 *{task['title']}*\n💰 المكافأة: {task['reward']} نقطة\n🔗 اضغط الزر لزيارة الموقع."
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
-async def show_balance(query, user_id: int):
-    """Show user balance"""
-    user = await get_user(user_id)
-    if not user:
-        await query.edit_message_text("⚠️ حدث خطأ، يرجى المحاولة لاحقاً")
-        return
-    
-    points = user["points"]
-    usd = points / POINTS_TO_USD
-    
-    balance_text = (
-        f"💰 رصيدك:\n\n"
-        f"📊 النقاط: {points}\n"
-        f"💵 الدولار: ${usd:.2f}\n\n"
-        f"💡 1000 نقطة = 1 دولار\n"
-        f"💸 الحد الأدنى للسحب: {MIN_WITHDRAWAL} نقطة"
-    )
-    
-    await query.edit_message_text(
-        balance_text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-    )
-
-async def show_referral(query, context, user_id: int):
-    """Show referral information and link"""
-    bot_username = (await context.bot.get_me()).username
-    referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    
-    referral_text = (
-        f"👥 دعوة الأصدقاء:\n\n"
-        f"🎁 احصل على {REFERRAL_POINTS} نقطة لكل صديق يدعوه عبر رابطك\n\n"
-        f"🔗 رابط الدعوة الخاص بك:\n"
-        f"`{referral_link}`\n\n"
-        f"📤 شارك الرابط مع أصدقائك لكسب النقاط!"
-    )
-    
-    await query.edit_message_text(
-        referral_text,
-        parse_mode="MARKDOWN",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 نسخ الرابط", callback_data="copy_link")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-        ])
-    )
-
-async def copy_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle copy link callback"""
-    query = update.callback_query
-    await query.answer("✅ تم نسخ الرابط!", show_alert=True)
-
-async def start_withdraw(query, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Start withdrawal process"""
-    user = await get_user(user_id)
-    if not user:
-        await query.edit_message_text("⚠️ حدث خطأ")
-        return
-    
-    points = user["points"]
-    if points < MIN_WITHDRAWAL:
-        await query.edit_message_text(
-            f"❌ لا يمكنك السحب حالياً\n\n"
-            f"رصيدك: {points} نقطة\n"
-            f"الحد الأدنى: {MIN_WITHDRAWAL} نقطة\n\n"
-            f"💡 أكمل المهام لزيادة رصيدك",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        return
-    
-    await query.edit_message_text(
-        f"💰 رصيدك المتاح: {points} نقطة\n"
-        f"💵 يعادل: ${points/POINTS_TO_USD:.2f}\n\n"
-        f"📝 أدخل المبلغ الذي تريد سحبه (بالنقاط):\n"
-        f"الحد الأدنى: {MIN_WITHDRAWAL}\n"
-        f"الحد الأقصى: {points}\n\n"
-        f"❗ أرسل رقم فقط (مثال: 1000)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")]])
-    )
-    return WITHDRAW_AMOUNT
-
-async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process withdrawal amount input"""
+async def show_balance(update: Update, context):
     user_id = update.effective_user.id
+    stats = await get_user_stats(user_id)
+    text = f"💎 *رصيدك:* {stats['points']} نقطة\n✅ *المهام المنجزة:* {stats['completed_tasks']}\n👥 *عدد المدعوين:* {stats['referrals']}"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def show_referral(update: Update, context):
+    bot_username = (await context.bot.get_me()).username
+    user_id = update.effective_user.id
+    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    stats = await get_user_stats(user_id)
+    text = f"👥 *نظام الإحالات*\n💰 لكل صديق جديد يدعوه، تحصل على 50 نقطة.\n\nرابط الإحالة الخاص بك:\n`{link}`\n\n👥 عدد المدعوين: {stats['referrals']}"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# Withdrawal conversation states
+AWAITING_WITHDRAW_AMOUNT = 1
+
+async def request_withdrawal(update: Update, context):
+    user_id = update.effective_user.id
+    stats = await get_user_stats(user_id)
+    if stats["points"] < 1000:
+        await update.message.reply_text("⚠️ الحد الأدنى للسحب هو 1000 نقطة. رصيدك غير كافٍ.")
+        return
+    context.user_data["awaiting_withdraw"] = True
+    await update.message.reply_text("💸 أدخل المبلغ الذي تريد سحبه (أرقام فقط):")
+    return AWAITING_WITHDRAW_AMOUNT
+
+async def process_withdraw_amount(update: Update, context):
+    if not context.user_data.get("awaiting_withdraw"):
+        return
     try:
         amount = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ يرجى إدخال رقم صحيح")
-        return WITHDRAW_AMOUNT
-    
-    user = await get_user(user_id)
-    if not user or user["points"] < amount or amount < MIN_WITHDRAWAL:
-        await update.message.reply_text(
-            f"❌ المبلغ غير صالح\n"
-            f"الحد الأدنى: {MIN_WITHDRAWAL}\n"
-            f"الحد الأقصى: {user['points'] if user else 0}"
-        )
-        return WITHDRAW_AMOUNT
-    
-    # Create withdrawal request
-    if await create_withdrawal(user_id, amount):
-        await update.message.reply_text(
-            f"✅ تم تقديم طلب السحب بنجاح!\n"
-            f"المبلغ: {amount} نقطة (${amount/POINTS_TO_USD:.2f})\n\n"
-            f"سيتم مراجعة طلبك من قبل الإدارة قريباً.",
-            reply_markup=get_main_menu(user_id == ADMIN_ID)
-        )
-        # Notify admin
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"💰 طلب سحب جديد!\n"
-            f"👤 المستخدم: {user_id}\n"
-            f"💵 المبلغ: {amount} نقطة (${amount/POINTS_TO_USD:.2f})"
-        )
+        await update.message.reply_text("❌ يرجى إدخال رقم صحيح.")
+        return AWAITING_WITHDRAW_AMOUNT
+    user_id = update.effective_user.id
+    success = await create_withdrawal_request(user_id, amount)
+    if success:
+        await update.message.reply_text("✅ تم إرسال طلب السحب إلى المشرف. سيتم إعلامك عند الموافقة.")
     else:
-        await update.message.reply_text("❌ حدث خطأ، يرجى المحاولة لاحقاً")
-    
+        await update.message.reply_text("❌ لا يمكن تقديم الطلب. تحقق من رصيدك أو من وجود طلب سابق معلق.")
+    context.user_data.pop("awaiting_withdraw", None)
     return ConversationHandler.END
 
-# ============= Admin Handlers =============
+async def cancel_withdraw(update: Update, context):
+    context.user_data.pop("awaiting_withdraw", None)
+    await update.message.reply_text("تم إلغاء طلب السحب.")
+    return ConversationHandler.END
 
-async def admin_add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start add task process"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("📝 أرسل عنوان المهمة:")
-    return ADD_TASK_TITLE
+# ------------------------------
+#  Admin Handlers
+# ------------------------------
+def is_admin_user(update: Update) -> bool:
+    return update.effective_user.id == ADMIN_ID
 
-async def admin_add_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get task title"""
+async def admin_menu(update: Update, context):
+    if not is_admin_user(update):
+        return
+    keyboard = [
+        ["➕ إضافة مهمة", "❌ حذف مهمة"],
+        ["📊 الإحصائيات", "📢 إرسال رسالة جماعية"],
+        ["💵 طلبات السحب", "🔙 رجوع"]
+    ]
+    await update.message.reply_text(
+        "🔧 *لوحة التحكم*",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+# Add task conversation states
+ASK_TITLE, ASK_REWARD, ASK_URL = range(10, 13)
+
+async def add_task_start(update: Update, context):
+    if not is_admin_user(update):
+        return
+    await update.message.reply_text("أرسل عنوان المهمة:")
+    return ASK_TITLE
+
+async def add_task_title(update: Update, context):
     context.user_data["task_title"] = update.message.text
-    await update.message.reply_text("🔗 أرسل رابط المهمة (destination URL):")
-    return ADD_TASK_URL
+    await update.message.reply_text("أرسل مكافأة المهمة (عدد النقاط):")
+    return ASK_REWARD
 
-async def admin_add_task_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get task URL"""
-    context.user_data["task_url"] = update.message.text
-    await update.message.reply_text("🎁 أرسل قيمة المكافأة (نقاط، الافتراضي 5):\n(أرسل رقم فقط)")
-    return ADD_TASK_REWARD
-
-async def admin_add_task_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get task reward and save"""
+async def add_task_reward(update: Update, context):
     try:
-        reward = int(update.message.text.strip())
+        reward = int(update.message.text)
+        context.user_data["task_reward"] = reward
+        await update.message.reply_text("أرسل رابط الهدف (target URL):")
+        return ASK_URL
     except ValueError:
-        reward = 5
-    
+        await update.message.reply_text("❌ يجب أن يكون المكافأة رقماً. أعد المحاولة:")
+        return ASK_REWARD
+
+async def add_task_url(update: Update, context):
+    url = update.message.text
     title = context.user_data["task_title"]
-    url = context.user_data["task_url"]
-    
-    if await add_task(title, url, reward):
-        await update.message.reply_text(
-            f"✅ تم إضافة المهمة بنجاح!\n\n"
-            f"العنوان: {title}\n"
-            f"الرابط: {url}\n"
-            f"المكافأة: {reward} نقطة",
-            reply_markup=get_main_menu(True)
-        )
-    else:
-        await update.message.reply_text("❌ حدث خطأ أثناء إضافة المهمة")
-    
+    reward = context.user_data["task_reward"]
+    await add_task(title, reward, url)
+    await update.message.reply_text(f"✅ تمت إضافة المهمة: {title}")
     return ConversationHandler.END
 
-async def admin_delete_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show tasks to delete"""
-    query = update.callback_query
-    await query.answer()
-    
+async def list_tasks_for_delete(update: Update, context):
+    if not is_admin_user(update):
+        return
     tasks = await get_active_tasks()
     if not tasks:
-        await query.edit_message_text("📭 لا توجد مهام لحذفها")
-        return ConversationHandler.END
-    
-    keyboard = []
-    for task in tasks:
-        keyboard.append([InlineKeyboardButton(
-            f"{task['title']} - {task['reward']} نقطة",
-            callback_data=f"delete_task_{task['id']}"
-        )])
-    keyboard.append([InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")])
-    
-    await query.edit_message_text(
-        "❌ اختر مهمة للحذف:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return DELETE_TASK_SELECT
-
-async def admin_delete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm task deletion"""
-    query = update.callback_query
-    await query.answer()
-    
-    task_id = int(query.data.split("_")[2])
-    if await delete_task(task_id):
-        await query.edit_message_text("✅ تم حذف المهمة بنجاح")
-    else:
-        await query.edit_message_text("❌ حدث خطأ أثناء الحذف")
-    
-    # Show main menu
-    await query.message.reply_text("القائمة الرئيسية:", reply_markup=get_main_menu(True))
-    return ConversationHandler.END
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show statistics"""
-    query = update.callback_query
-    await query.answer()
-    
-    total_users = await get_total_users()
-    total_points = await get_total_points()
-    completed_tasks = await get_completed_tasks_count()
-    total_usd = total_points / POINTS_TO_USD
-    
-    stats_text = (
-        f"📊 إحصائيات البوت:\n\n"
-        f"👥 عدد المستخدمين: {total_users}\n"
-        f"💰 إجمالي النقاط: {total_points}\n"
-        f"💵 إجمالي الدولار: ${total_usd:.2f}\n"
-        f"✅ المهام المكتملة: {completed_tasks}\n"
-        f"📈 متوسط النقاط لكل مستخدم: {total_points/total_users if total_users > 0 else 0:.1f}"
-    )
-    
-    await query.edit_message_text(
-        stats_text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]])
-    )
-
-async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start broadcast process"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("📢 أرسل الرسالة التي تريد إذاعتها لجميع المستخدمين:")
-    return BROADCAST_MESSAGE
-
-async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send broadcast message"""
-    message_text = update.message.text
-    await update.message.reply_text("⏳ جاري إرسال الرسالة...")
-    
-    users = await get_all_users()
-    success_count = 0
-    fail_count = 0
-    
-    for user in users:
-        try:
-            await context.bot.send_message(user["user_id"], f"📢 إعلان:\n\n{message_text}")
-            success_count += 1
-            await asyncio.sleep(0.05)  # Small delay to avoid flooding
-        except Exception as e:
-            fail_count += 1
-            logger.error(f"Failed to send to {user['user_id']}: {e}")
-    
-    await update.message.reply_text(
-        f"✅ تم إرسال الإذاعة!\n"
-        f"تم التسليم: {success_count}\n"
-        f"فشل: {fail_count}\n"
-        f"إجمالي: {len(users)}",
-        reply_markup=get_main_menu(True)
-    )
-    return ConversationHandler.END
-
-async def admin_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show pending withdrawals"""
-    query = update.callback_query
-    await query.answer()
-    
-    withdrawals = await get_pending_withdrawals()
-    if not withdrawals:
-        await query.edit_message_text("📭 لا توجد طلبات سحب معلقة")
+        await update.message.reply_text("لا توجد مهام لحذفها.")
         return
-    
-    keyboard = []
-    for w in withdrawals:
-        keyboard.append([InlineKeyboardButton(
-            f"طلب #{w['id']} - {w['amount']} نقطة - مستخدم: {w['user_id']}",
-            callback_data=f"withdraw_{w['id']}_{w['user_id']}"
-        )])
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
-    
-    await query.edit_message_text(
-        "💵 طلبات السحب المعلقة:\n\nاختر طلباً للموافقة أو الرفض:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    keyboard = [[InlineKeyboardButton(t["title"], callback_data=f"del_{t['id']}")] for t in tasks]
+    await update.message.reply_text("اختر مهمة لحذفها:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def delete_task_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.split("_")[1])
+    await delete_task(task_id)
+    await query.edit_message_text("✅ تم حذف المهمة.")
+
+async def show_statistics(update: Update, context):
+    if not is_admin_user(update):
+        return
+    stats = await get_statistics()
+    text = (
+        f"📊 *الإحصائيات*\n"
+        f"👥 المستخدمين: {stats['total_users']}\n"
+        f"✅ المهام المنجزة: {stats['total_completed_tasks']}\n"
+        f"💎 إجمالي النقاط الموزعة: {stats['total_points_distributed']}\n"
+        f"⏳ طلبات السحب المعلقة: {stats['pending_withdrawals']}"
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def admin_withdraw_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle withdrawal action (approve/reject)"""
+# Broadcast conversation
+AWAITING_BROADCAST_MSG = 20
+
+async def broadcast_prompt(update: Update, context):
+    if not is_admin_user(update):
+        return
+    await update.message.reply_text("أرسل الرسالة التي تريد إذاعتها لجميع المستخدمين:")
+    return AWAITING_BROADCAST_MSG
+
+async def send_broadcast(update: Update, context):
+    if not context.user_data.get("broadcasting"):
+        return
+    msg = update.message.text
+    users = await get_all_users()
+    sent = 0
+    for u in users:
+        try:
+            await context.bot.send_message(
+                chat_id=u["telegram_id"],
+                text=f"📢 *رسالة جماعية*\n{msg}",
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Broadcast failed to {u['telegram_id']}: {e}")
+    await update.message.reply_text(f"✅ تم إرسال الرسالة إلى {sent} مستخدم.")
+    context.user_data.pop("broadcasting", None)
+    return ConversationHandler.END
+
+async def cancel_broadcast(update: Update, context):
+    context.user_data.pop("broadcasting", None)
+    await update.message.reply_text("تم إلغاء الإذاعة.")
+    return ConversationHandler.END
+
+async def withdrawal_requests_list(update: Update, context):
+    if not is_admin_user(update):
+        return
+    pending = await get_pending_withdrawals()
+    if not pending:
+        await update.message.reply_text("لا توجد طلبات سحب معلقة.")
+        return
+    for req in pending:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ موافقة", callback_data=f"approve_{req['id']}"),
+             InlineKeyboardButton("❌ رفض", callback_data=f"reject_{req['id']}")]
+        ])
+        user = req.get("users", {})
+        text = f"👤 المستخدم: {user.get('username', user.get('telegram_id'))}\n💵 المبلغ: {req['amount']} نقطة"
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+async def handle_withdrawal_action(update: Update, context):
     query = update.callback_query
     await query.answer()
-    
-    parts = query.data.split("_")
-    request_id = int(parts[1])
-    user_id = int(parts[2])
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ موافقة", callback_data=f"approve_{request_id}_{user_id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"reject_{request_id}_{user_id}")
-        ],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_withdrawals")]
-    ])
-    
-    await query.edit_message_text(
-        f"طلب سحب #{request_id}\n"
-        f"المستخدم: {user_id}\n"
-        f"اختر الإجراء:",
-        reply_markup=keyboard
-    )
+    action, w_id = query.data.split("_")
+    w_id = int(w_id)
+    if action == "approve":
+        await update_withdrawal_status(w_id, "approved", deduct_points=True)
+        await query.edit_message_text("✅ تمت الموافقة على السحب.")
+    elif action == "reject":
+        await update_withdrawal_status(w_id, "rejected")
+        await query.edit_message_text("❌ تم رفض السحب.")
 
-async def admin_withdraw_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve withdrawal"""
-    query = update.callback_query
-    await query.answer()
-    
-    parts = query.data.split("_")
-    request_id = int(parts[1])
-    user_id = int(parts[2])
-    
-    if await update_withdrawal_status(request_id, "approved", user_id):
-        await query.edit_message_text("✅ تمت الموافقة على طلب السحب")
-        # Notify user
-        await context.bot.send_message(
-            user_id,
-            f"✅ تمت الموافقة على طلب السحب الخاص بك!\n"
-            f"سيتم إرسال المبلغ إلى حسابك قريباً."
-        )
-    else:
-        await query.edit_message_text("❌ حدث خطأ")
-    
-    # Show admin panel
-    await query.message.reply_text("لوحة التحكم:", reply_markup=get_admin_panel())
-
-async def admin_withdraw_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reject withdrawal"""
-    query = update.callback_query
-    await query.answer()
-    
-    parts = query.data.split("_")
-    request_id = int(parts[1])
-    user_id = int(parts[2])
-    
-    if await update_withdrawal_status(request_id, "rejected", None):
-        await query.edit_message_text("❌ تم رفض طلب السحب")
-        # Notify user
-        await context.bot.send_message(
-            user_id,
-            f"❌ لقد تم رفض طلب السحب الخاص بك.\n"
-            f"يرجى التواصل مع الإدارة لمزيد من المعلومات."
-        )
-    else:
-        await query.edit_message_text("❌ حدث خطأ")
-    
-    # Show admin panel
-    await query.message.reply_text("لوحة التحكم:", reply_markup=get_admin_panel())
-
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel current conversation"""
+async def back_to_main(update: Update, context):
+    user_id = update.effective_user.id
+    is_admin = (user_id == ADMIN_ID)
     await update.message.reply_text(
-        "❌ تم الإلغاء",
-        reply_markup=get_main_menu(update.effective_user.id == ADMIN_ID)
+        "🔙 رجوع إلى القائمة الرئيسية",
+        reply_markup=await main_menu_keyboard(is_admin)
     )
     return ConversationHandler.END
 
-# ============= FastAPI Web Server =============
+# ------------------------------
+#  Web Server – /go Endpoint
+# ------------------------------
+async def handle_go(request: web.Request) -> web.Response:
+    """Awards points when user visits the task link."""
+    params = request.rel_url.query
+    task_id_str = params.get("task_id")
+    user_id_str = params.get("user_id")
+    if not task_id_str or not user_id_str:
+        return web.Response(text="طلب غير صحيح", status=400)
 
-app = FastAPI()
-
-@app.get("/reward")
-async def reward_endpoint(user_id: int, task_id: int):
-    """Handle task completion verification"""
     try:
-        # Check if user exists
-        user = await get_user(user_id)
-        if not user:
-            return HTMLResponse("<h3>⚠️ مستخدم غير موجود</h3><p>يرجى تسجيل الدخول إلى البوت أولاً</p>")
-        
-        # Check if task already completed
-        completed = await supabase.table("completed_tasks").select("*").eq("user_id", user_id).eq("task_id", task_id).execute()
-        if completed.data:
-            return HTMLResponse("<h3>✅ تم إكمال هذه المهمة مسبقاً</h3><p>لقد حصلت على مكافأتك بالفعل</p>")
-        
-        # Get task
-        task = await supabase.table("tasks").select("*").eq("id", task_id).eq("active", True).execute()
-        if not task.data:
-            return HTMLResponse("<h3>⚠️ المهمة غير موجودة أو غير نشطة</h3>")
-        
-        # Complete task and award points
-        if await complete_task(user_id, task_id):
-            reward = task.data[0]["reward"]
-            return HTMLResponse(f"""
-            <html>
-            <head><title>تم إكمال المهمة</title></head>
-            <body style="font-family: Arial; text-align: center; padding: 50px;">
-                <h2>✅ تم إكمال المهمة بنجاح!</h2>
-                <p>لقد حصلت على {reward} نقطة</p>
-                <p>يمكنك العودة إلى البوت لمواصلة المهام</p>
-                <a href="https://t.me/{(await supabase.table('users').select('*').limit(1).execute()).data[0].get('username', '')}">العودة إلى البوت</a>
-            </body>
-            </html>
-            """)
-        else:
-            return HTMLResponse("<h3>⚠️ حدث خطأ أثناء إكمال المهمة</h3>")
-    except Exception as e:
-        logger.error(f"Reward endpoint error: {e}")
-        return HTMLResponse("<h3>⚠️ حدث خطأ داخلي</h3>")
+        task_id = int(task_id_str)
+        user_telegram_id = int(user_id_str)
+    except ValueError:
+        return web.Response(text="معطيات غير صالحة", status=400)
 
-# ============= Main Function =============
+    # Check and award points
+    success = await complete_task(user_telegram_id, task_id)
+    if success:
+        # Optionally send a real-time Telegram notification
+        try:
+            bot_app = request.app["bot_app"]
+            await bot_app.bot.send_message(
+                chat_id=user_telegram_id,
+                text="🎉 *تهانينا!*\nتم إكمال المهمة بنجاح وأضيفت النقاط إلى رصيدك.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Notification failed: {e}")
 
-async def main():
-    """Main function to run the bot and web server"""
-    # Create bot application
+        html_response = """
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"><title>تم بنجاح</title></head>
+        <body style="text-align:center;font-family:Arial;padding:50px;">
+            <h1>✅ تم إكمال المهمة!</h1>
+            <p>تم إضافة النقاط إلى حسابك في البوت.</p>
+            <p>يمكنك العودة إلى Telegram ومتابعة المهام.</p>
+        </body>
+        </html>
+        """
+        return web.Response(text=html_response, content_type="text/html")
+    else:
+        html_response = """
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"><title>خطأ</title></head>
+        <body style="text-align:center;font-family:Arial;padding:50px;">
+            <h1>⚠️ لا يمكن إكمال المهمة</h1>
+            <p>إما أنك أكملت هذه المهمة مسبقاً أو أن المهمة غير موجودة.</p>
+        </body>
+        </html>
+        """
+        return web.Response(text=html_response, content_type="text/html", status=400)
+
+async def web_server(app: web.Application):
+    """Start aiohttp server."""
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Web server running on port {PORT}")
+
+# ------------------------------
+#  Main Application
+# ------------------------------
+def main():
+    # Create Telegram application
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add command handlers
+    application.bot_data["ADMIN_ID"] = ADMIN_ID
+    application.bot_data["DOMAIN"] = DOMAIN
+
+    # --- User handlers ---
     application.add_handler(CommandHandler("start", start))
-    
-    # Add conversation handlers for admin functions
-    add_task_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_task_start, pattern="^admin_add_task$")],
-        states={
-            ADD_TASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_task_title)],
-            ADD_TASK_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_task_url)],
-            ADD_TASK_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_task_reward)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    
-    delete_task_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_delete_task_start, pattern="^admin_delete_task$")],
-        states={
-            DELETE_TASK_SELECT: [CallbackQueryHandler(admin_delete_task_confirm, pattern="^delete_task_")],
-        },
-        fallbacks=[],
-    )
-    
-    broadcast_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_broadcast_start, pattern="^admin_broadcast$")],
-        states={
-            BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    
+    application.add_handler(MessageHandler(filters.Regex(f"^{MAIN_MENU_TEXTS['tasks']}$"), show_tasks))
+    application.add_handler(MessageHandler(filters.Regex(f"^{MAIN_MENU_TEXTS['balance']}$"), show_balance))
+    application.add_handler(MessageHandler(filters.Regex(f"^{MAIN_MENU_TEXTS['referral']}$"), show_referral))
+
     withdraw_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_withdraw, pattern="^menu_withdraw$")],
+        entry_points=[MessageHandler(filters.Regex(f"^{MAIN_MENU_TEXTS['withdraw']}$"), request_withdrawal)],
         states={
-            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_withdraw_amount)],
+            AWAITING_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_withdraw_amount)],
         },
-        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^back_to_main$")],
+        fallbacks=[CommandHandler("cancel", cancel_withdraw)],
     )
-    
-    # Add all handlers
-    application.add_handler(add_task_conv)
-    application.add_handler(delete_task_conv)
-    application.add_handler(broadcast_conv)
     application.add_handler(withdraw_conv)
-    
-    # Callback handlers
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
-    application.add_handler(CallbackQueryHandler(copy_link_callback, pattern="^copy_link$"))
-    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    application.add_handler(CallbackQueryHandler(admin_withdrawals, pattern="^admin_withdrawals$"))
-    application.add_handler(CallbackQueryHandler(admin_withdraw_action, pattern="^withdraw_"))
-    application.add_handler(CallbackQueryHandler(admin_withdraw_approve, pattern="^approve_"))
-    application.add_handler(CallbackQueryHandler(admin_withdraw_reject, pattern="^reject_"))
-    
-    # Set bot commands
-    await application.bot.set_my_commands([
-        ("start", "بدء البوت"),
-        ("menu", "القائمة الرئيسية"),
-    ])
-    
+
+    # --- Admin handlers ---
+    application.add_handler(MessageHandler(filters.Regex(f"^{ADMIN_BUTTON_TEXT}$"), admin_menu))
+    application.add_handler(MessageHandler(filters.Regex("^🔙 رجوع$"), back_to_main))
+
+    # Add task conversation
+    add_task_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ إضافة مهمة$"), add_task_start)],
+        states={
+            ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_title)],
+            ASK_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_reward)],
+            ASK_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_url)],
+        },
+        fallbacks=[CommandHandler("cancel", back_to_main)],
+    )
+    application.add_handler(add_task_conv)
+
+    application.add_handler(MessageHandler(filters.Regex("^❌ حذف مهمة$"), list_tasks_for_delete))
+    application.add_handler(CallbackQueryHandler(delete_task_callback, pattern="^del_"))
+    application.add_handler(MessageHandler(filters.Regex("^📊 الإحصائيات$"), show_statistics))
+
+    # Broadcast conversation
+    broadcast_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📢 إرسال رسالة جماعية$"), broadcast_prompt)],
+        states={
+            AWAITING_BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_broadcast)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_broadcast)],
+    )
+    application.add_handler(broadcast_conv)
+
+    application.add_handler(MessageHandler(filters.Regex("^💵 طلبات السحب$"), withdrawal_requests_list))
+    application.add_handler(CallbackQueryHandler(handle_withdrawal_action, pattern="^(approve|reject)_"))
+
+    # --- Web server setup ---
+    web_app = web.Application()
+    web_app.router.add_get("/go", handle_go)
+    web_app["bot_app"] = application   # store for notification use
+
+    async def on_startup():
+        # Start web server in background
+        asyncio.create_task(web_server(web_app))
+        logger.info("Web server task started")
+
+    application.post_init = on_startup
+
     # Start bot polling
-    async with application:
-        await application.start()
-        logger.info("Bot started successfully")
-        
-        # Start web server
-        port = int(os.getenv("PORT", 8000))
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-        server = uvicorn.Server(config)
-        
-        # Run both bot and web server concurrently
-        await asyncio.gather(
-            application.updater.start_polling(),
-            server.serve()
-        )
+    logger.info("Bot started")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
