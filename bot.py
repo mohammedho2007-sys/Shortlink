@@ -29,10 +29,10 @@ from aiohttp import web
 #  Environment & Configuration
 # ------------------------------
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+BOT_TOKEN = os.getenv("8837715030:AAHffgOJi12MgvlmMxf_wKHtE7SSM8QUBF8")
+SUPABASE_URL = os.getenv("https://xlvcpsjntuymdtsmernk.supabase.co")
+SUPABASE_KEY = os.getenv("sb_publishable_HqkHcY64gIGbwuBO9urINg_vok-GaFZ")
+ADMIN_ID = int(os.getenv("8411026975"))
 DOMAIN = os.getenv("DOMAIN")          # e.g. https://your-app.railway.app
 PORT = int(os.environ.get("PORT", 8080))
 
