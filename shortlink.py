@@ -23,12 +23,11 @@ from supabase.lib.client_options import ClientOptions
 
 # ========== CONFIGURATION ==========
 # Environment variables (set before running)
-BOT_TOKEN = os.environ.get("8837715030:AAHffgOJi12MgvlmMxf_wKHtE7SSM8QUBF8")
-SUPABASE_URL = os.environ.get("https://xlvcpsjntuymdtsmernk.supabase.co")
-SUPABASE_KEY = os.environ.get("sb_publishable_HqkHcY64gIGbwuBO9urINg_vok-GaFZ")
-ADMIN_ID = int(os.environ.get("8411026975", "0"))
-DOMAIN = os.environ.get("DOMAIN", "https://YOUR_DOMAIN.vercel.app")
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+DOMAIN = os.environ.get("DOMAIN", "https://YOUR_DOMAIN.up.railway.app")
 # Constants
 MIN_WITHDRAW = 1000
 REFERRAL_REWARD = 50
